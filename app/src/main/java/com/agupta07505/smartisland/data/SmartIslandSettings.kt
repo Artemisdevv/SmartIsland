@@ -151,6 +151,7 @@ data class SmartIslandSettings(
     val swipeLeftAction: String = "NextEvent",
     val swipeRightAction: String = "PreviousEvent",
     val swipeHorizontalCollapsedAction: String = "NextPrevious",
+    val appleStyleGestures: Boolean = false,
     val enablePillSwipeActions: Boolean = true,
     val pillSwipeUpAction: String = "DismissCurrent",
     val pillSwipeDownAction: String = "Expand",
@@ -540,6 +541,7 @@ data class SmartIslandSettings(
         settingsObj.put("swipeLeftAction", swipeLeftAction)
         settingsObj.put("swipeRightAction", swipeRightAction)
         settingsObj.put("swipeHorizontalCollapsedAction", swipeHorizontalCollapsedAction)
+        settingsObj.put("appleStyleGestures", appleStyleGestures)
         settingsObj.put("enablePillSwipeActions", enablePillSwipeActions)
         settingsObj.put("pillSwipeUpAction", pillSwipeUpAction)
         settingsObj.put("pillSwipeDownAction", pillSwipeDownAction)
@@ -980,6 +982,7 @@ data class SmartIslandSettings(
                 swipeLeftAction = obj.optString("swipeLeftAction", defaults.swipeLeftAction),
                 swipeRightAction = obj.optString("swipeRightAction", defaults.swipeRightAction),
                 swipeHorizontalCollapsedAction = obj.optString("swipeHorizontalCollapsedAction", defaults.swipeHorizontalCollapsedAction),
+                appleStyleGestures = obj.optBoolean("appleStyleGestures", defaults.appleStyleGestures),
                 enablePillSwipeActions = obj.optBoolean("enablePillSwipeActions", defaults.enablePillSwipeActions),
                 pillSwipeUpAction = obj.optString("pillSwipeUpAction", defaults.pillSwipeUpAction),
                 pillSwipeDownAction = obj.optString("pillSwipeDownAction", defaults.pillSwipeDownAction),

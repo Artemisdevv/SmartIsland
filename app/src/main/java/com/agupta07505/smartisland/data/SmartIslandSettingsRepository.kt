@@ -137,6 +137,7 @@ class SmartIslandSettingsRepository(private val context: Context) {
         val SwipeLeftAction = stringPreferencesKey("swipe_left_action")
         val SwipeRightAction = stringPreferencesKey("swipe_right_action")
         val SwipeHorizontalCollapsedAction = stringPreferencesKey("swipe_horizontal_collapsed_action")
+        val AppleStyleGestures = booleanPreferencesKey("apple_style_gestures")
         val EnablePillSwipeActions = booleanPreferencesKey("enable_pill_swipe_actions")
         val PillSwipeUpAction = stringPreferencesKey("pill_swipe_up_action")
         val PillSwipeDownAction = stringPreferencesKey("pill_swipe_down_action")
@@ -445,6 +446,7 @@ class SmartIslandSettingsRepository(private val context: Context) {
                 swipeLeftAction = prefs[Keys.SwipeLeftAction] ?: defaults.swipeLeftAction,
                 swipeRightAction = prefs[Keys.SwipeRightAction] ?: defaults.swipeRightAction,
                 swipeHorizontalCollapsedAction = prefs[Keys.SwipeHorizontalCollapsedAction] ?: defaults.swipeHorizontalCollapsedAction,
+                appleStyleGestures = prefs[Keys.AppleStyleGestures] ?: defaults.appleStyleGestures,
                 enablePillSwipeActions = prefs[Keys.EnablePillSwipeActions] ?: defaults.enablePillSwipeActions,
                 pillSwipeUpAction = prefs[Keys.PillSwipeUpAction] ?: defaults.pillSwipeUpAction,
                 pillSwipeDownAction = prefs[Keys.PillSwipeDownAction] ?: defaults.pillSwipeDownAction,
@@ -1300,6 +1302,10 @@ class SmartIslandSettingsRepository(private val context: Context) {
     suspend fun setSwipeRightAction(value: String) = editSafely {
         it[Keys.SwipeRightAction] = value
     }
+    suspend fun setAppleStyleGestures(value: Boolean) = editSafely {
+        it[Keys.AppleStyleGestures] = value
+    }
+
     suspend fun setEnablePillSwipeActions(value: Boolean) = editSafely {
         it[Keys.EnablePillSwipeActions] = value
     }
@@ -1528,6 +1534,7 @@ class SmartIslandSettingsRepository(private val context: Context) {
         prefs[Keys.SwipeLeftAction] = settings.swipeLeftAction
         prefs[Keys.SwipeRightAction] = settings.swipeRightAction
         prefs[Keys.SwipeHorizontalCollapsedAction] = settings.swipeHorizontalCollapsedAction
+        prefs[Keys.AppleStyleGestures] = settings.appleStyleGestures
         prefs[Keys.EnablePillSwipeActions] = settings.enablePillSwipeActions
         prefs[Keys.PillSwipeUpAction] = settings.pillSwipeUpAction
         prefs[Keys.PillSwipeDownAction] = settings.pillSwipeDownAction

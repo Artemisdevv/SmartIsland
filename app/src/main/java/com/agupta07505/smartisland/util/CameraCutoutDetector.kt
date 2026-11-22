@@ -19,7 +19,8 @@ data class DetectedCutoutInfo(
     val yOffsetDp: Float,
     val widthDp: Float,
     val heightDp: Float,
-    val hasHardwareCutout: Boolean
+    val hasHardwareCutout: Boolean,
+    val rawArea: com.agupta07505.smartisland.model.CutoutArea? = null
 )
 
 object CameraCutoutDetector {
@@ -90,7 +91,10 @@ object CameraCutoutDetector {
             yOffsetDp = yOffsetDp,
             widthDp = widthDp,
             heightDp = heightDp,
-            hasHardwareCutout = true
+            hasHardwareCutout = true,
+            rawArea = com.agupta07505.smartisland.model.CutoutArea(
+                xOffsetPx / density, top / density, (right - left) / density, (bottom - top) / density
+            )
         )
     }
 

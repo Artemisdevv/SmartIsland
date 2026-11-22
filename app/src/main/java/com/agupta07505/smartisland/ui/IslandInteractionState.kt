@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 internal class IslandInteractionState {
     /** Window position of the pill's gesture area, to turn a touch position into window pixels. */
     var gestureOrigin: androidx.compose.ui.geometry.Offset = androidx.compose.ui.geometry.Offset.Zero
+    var gestureScreenX: Float = Float.NaN
     /** True while the floating-window handle at the bottom of the expanded island owns the touch; the island's own gestures skip it. */
     var handleOwnsTouch: Boolean = false
     /**

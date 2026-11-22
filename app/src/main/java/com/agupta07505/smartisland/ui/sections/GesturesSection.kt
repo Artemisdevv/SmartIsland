@@ -259,6 +259,25 @@ fun GesturesSection(
                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
             ) {
                 GestureSensitivityRow(settings = settings, repository = repository)
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(stringResource(R.string.apple_style_gestures_title), style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            stringResource(R.string.apple_style_gestures_desc),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.appleStyleGestures,
+                        onCheckedChange = { enabled -> coroutineScope.launch { repository.setAppleStyleGestures(enabled) } }
+                    )
+                }
             }
 
             Card(

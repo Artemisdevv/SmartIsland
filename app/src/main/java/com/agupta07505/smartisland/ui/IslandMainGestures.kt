@@ -21,10 +21,18 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
 import com.agupta07505.smartisland.data.SmartIslandSettings
 import com.agupta07505.smartisland.di.SmartIslandRepositories
 import com.agupta07505.smartisland.model.StepDrag
+import com.agupta07505.smartisland.model.CUTOUT_TARGET_MIN_WIDTH_DP
+import com.agupta07505.smartisland.model.CUTOUT_SWIPE_THRESHOLD_DP
+import com.agupta07505.smartisland.model.CollapsedCardTap
+import com.agupta07505.smartisland.model.IslandNotification
 import com.agupta07505.smartisland.model.SwipeAction
+import com.agupta07505.smartisland.model.collapsedCardTap
+import com.agupta07505.smartisland.model.isInwardCutoutSwipe
+import com.agupta07505.smartisland.model.isOutwardCutoutSwipe
 import com.agupta07505.smartisland.model.launcherOwnsDrag
 import com.agupta07505.smartisland.ui.expanded.readingTextOwnsDrag
 import com.agupta07505.smartisland.ui.expanded.siblingPickerOwnsDrag
@@ -76,12 +84,21 @@ internal fun Modifier.islandMainGestures(
     pickerLeftFraction: State<Float>,
     pickerOnLeft: State<Boolean>,
     centreOverlapsCutout: Boolean = false,
-    pillHasContent: Boolean = true
+    pillHasContent: Boolean = true,
+    appleGestureCenterX: Float? = null,
+    canUseAppleGesture: () -> Boolean = { true },
+    onHideActivity: State<(IslandNotification) -> Boolean>,
+    onRestoreActivity: State<() -> Boolean>,
+    canRestoreActivity: State<() -> Boolean>
 ): Modifier {
     val displayMetrics = context.resources.displayMetrics
     return this
-        .onGloballyPositioned { ui.gestureOrigin = it.positionInWindow() }
-        .pointerInput(displayMetrics.density, isInputActive, isLandscape, centreOverlapsCutout, pillHasContent) {
+        .onGloballyPositioned {
+            ui.gestureOrigin = it.positionInWindow()
+            ui.gestureScreenX = it.localToScreen(androidx.compose.ui.geometry.Offset.Zero).x
+        }
+        .pointerInput(displayMetrics.density, isInputActive, isLandscape, centreOverlapsCutout, pillHasContent,
+            settings.appleStyleGestures, appleGestureCenterX) {
             if (isInputActive) return@pointerInput
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -119,6 +136,20 @@ internal fun Modifier.islandMainGestures(
                 var crossedOnce = false
                 val pressTimeMs = System.currentTimeMillis()
                 val wasExpandedAtStart = cb.currentExpanded
+                val appleStyle = settings.appleStyleGestures && !isLandscape
+                val cardAtDown = cb.currentNotifications.getOrNull(cb.currentSelectedIndex)
+                val startFromCamera = appleGestureCenterX?.let { down.position.x + ui.gestureScreenX - it }
+                val appleCardGesture = appleStyle && !wasExpandedAtStart && cardAtDown != null
+                val cutoutThresholdPx = sensitivity.scaled(CUTOUT_SWIPE_THRESHOLD_DP) * displayMetrics.density
+                val canRestoreAtDown = appleCardGesture && canRestoreActivity.value()
+                var cutoutSwipeClaimed = false
+                fun isInward(dx: Float, dy: Float): Boolean =
+                    appleCardGesture && startFromCamera != null &&
+                        isInwardCutoutSwipe(startFromCamera, dx, dy, cutoutThresholdPx, sensitivity)
+                fun isOutward(dx: Float, dy: Float): Boolean =
+                    canRestoreAtDown && startFromCamera != null &&
+                        abs(startFromCamera) <= CUTOUT_TARGET_MIN_WIDTH_DP * displayMetrics.density / 2f &&
+                        isOutwardCutoutSwipe(startFromCamera, dx, dy, cutoutThresholdPx, sensitivity)
                 // Sibling picker open when the touch began, and where in the island it landed.
                 val pickerOpenAtStart = cb.currentSiblingPickerOpen
                 val readingTextAtStart = cb.currentReadingExpandedText
@@ -204,7 +235,12 @@ internal fun Modifier.islandMainGestures(
                     }
                     // Long press on the collapsed pill (also on the idle pill, which is what
                     // a hidden pill shows). Fires at once, while the finger is still down.
-                    if (!wasExpandedAtStart && !isDragging && !pillGestureTriggered) {
+                    if (appleCardGesture && !isDragging && !pillGestureTriggered) {
+                        pillGestureTriggered = true
+                        if (canUseAppleGesture() && cb.currentNotifications.getOrNull(cb.currentSelectedIndex)?.key == cardAtDown.key) {
+                            cb.currentOnToggle()
+                        }
+                    } else if (!wasExpandedAtStart && !isDragging && !pillGestureTriggered) {
                         // Portrait: the Open Apps shortcut (see longPressOpensApps); otherwise the normal long-press action.
                         val inCentreBand = pillCenterTapHit(
                             xPx = down.position.x, yPx = down.position.y, shellWidthPx = size.width.toFloat(),
@@ -244,6 +280,7 @@ internal fun Modifier.islandMainGestures(
                 while (true) {
                     val event = awaitPointerEvent()
                     val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                    if (appleCardGesture && event.changes.any { it.id != pointerId && it.pressed }) break
 
                     // A picker row consumes its own (accepted) tap; the island must still see that lift, or this loop would wait for
                     // the next touch and the hold buzz would fire 300 ms later.
@@ -363,8 +400,20 @@ internal fun Modifier.islandMainGestures(
                             if (!pillGestureTriggered) {
                                 val isPillSwipeEnabled = cb.currentSettings.enablePillSwipeActions || idleWidgetSwipe()
                                 val fireDirection = if (isPillSwipeEnabled) pillArming.direction else null
+                                val finalDelta = change.positionChangeIgnoreConsumed()
+                                val dx = rawDragX + finalDelta.x
+                                val dy = rawDragY + finalDelta.y
 
-                                if (fireDirection != null) {
+                                if (appleCardGesture && !canUseAppleGesture()) {
+                                    break
+                                } else if (cardAtDown != null && isInward(dx, dy)) {
+                                    onHideActivity.value(cardAtDown)
+                                } else if (isOutward(dx, dy)) {
+                                    if (onRestoreActivity.value()) ui.touch()
+                                } else if (cutoutSwipeClaimed) {
+                                    // A cancelled cutout swipe must not commit a previously armed card action or tap.
+                                    break
+                                } else if (fireDirection != null) {
                                     pillGestureTriggered = true
                                     commitPillSwipe(fireDirection, dragAccumulatorX, cb, runner, ui, scope, maxSlidePx)
                                 } else if ((isPillSwipeEnabled && crossedOnce) || tapGuard.exceeded) {
@@ -397,20 +446,24 @@ internal fun Modifier.islandMainGestures(
                                             ui.onWidgetValueTap?.invoke()
                                         } else if (cb.currentNotifications.isEmpty() && cb.currentHasIdleStoredCards) {
                                             cb.currentOnRevealIdleCards()
-                                        } else if (portraitCenterTapIsIdleControl(isLandscape, settings.enableNotchMode, cb.currentNotifications.isNotEmpty()) &&
-                                            pillCenterTapHit(
-                                                xPx = down.position.x, yPx = down.position.y, shellWidthPx = size.width.toFloat(),
-                                                pillWidthPx = settings.width * displayMetrics.density,
-                                                pillHeightPx = settings.height * displayMetrics.density
-                                            )
-                                        ) {
-                                            // The empty middle of the collapsed pill puts every card away (a glyph still expands).
-                                            cb.currentOnIdleDotTap()
                                         } else if (isLandscape && !settings.enableNotchMode && cb.currentNotifications.isEmpty()) {
                                             cb.currentOnIdleDotTap()
-                                        } else if (cb.currentNotifications.isNotEmpty()) {
-                                            // (An empty island does not open the shortcuts on a tap: that is a long press.)
-                                            cb.currentOnToggle()
+                                        } else if (currentNotification != null) {
+                                            val inCenter = portraitCenterTapIsIdleControl(isLandscape, settings.enableNotchMode, true) &&
+                                                pillCenterTapHit(
+                                                    xPx = down.position.x, yPx = down.position.y, shellWidthPx = size.width.toFloat(),
+                                                    pillWidthPx = settings.width * displayMetrics.density,
+                                                    pillHeightPx = settings.height * displayMetrics.density
+                                                )
+                                            when (collapsedCardTap(appleStyle, inCenter)) {
+                                                CollapsedCardTap.OpenApp -> if (canUseAppleGesture() &&
+                                                    !cb.currentExpanded && currentNotification.key == cardAtDown?.key
+                                                ) {
+                                                    cb.currentOnOpenNotification(currentNotification)
+                                                }
+                                                CollapsedCardTap.PutAway -> cb.currentOnIdleDotTap()
+                                                CollapsedCardTap.Expand -> cb.currentOnToggle()
+                                            }
                                         }
                                     }
                                 }
@@ -585,12 +638,21 @@ internal fun Modifier.islandMainGestures(
                                     dragAccumulatorY.coerceAtLeast(-DRAG_MAX_OFFSET_DP * displayMetrics.density)
                                 }
                             } else {
-                                ui.pillDragOffsetX = softFollow(dragAccumulatorX, 0.35f, 24f * displayMetrics.density)
-                                ui.dragOffset = softFollow(
+                                if (!pillGestureTriggered && !cutoutSwipeClaimed &&
+                                    (isInward(rawDragX, rawDragY) || isOutward(rawDragX, rawDragY))
+                                ) {
+                                    cutoutSwipeClaimed = true
+                                    pillArming.reset()
+                                    holdJob.cancel()
+                                    scope.launch { ui.pillArm.snapTo(0f) }
+                                }
+                                ui.pillDragOffsetX = if (cutoutSwipeClaimed) 0f else
+                                    softFollow(dragAccumulatorX, 0.35f, 24f * displayMetrics.density)
+                                ui.dragOffset = if (cutoutSwipeClaimed) 0f else softFollow(
                                     dragAccumulatorY, 0.35f, SwipeFeel.PILL_LEAN_Y_MAX_DP * displayMetrics.density
                                 )
 
-                                val pillHorizontal = sensitivity.isHorizontal(dragAccumulatorX, dragAccumulatorY)
+                                val pillHorizontal = !cutoutSwipeClaimed && sensitivity.isHorizontal(dragAccumulatorX, dragAccumulatorY)
                                 ui.pillContentDragX = if (pillHorizontal) {
                                     softFollow(dragAccumulatorX, PILL_CONTENT_FOLLOW, maxSlidePx)
                                 } else 0f
@@ -605,7 +667,9 @@ internal fun Modifier.islandMainGestures(
                                 if (abs(dragAccumulatorX) >= pillThresholdPx || abs(dragAccumulatorY) >= pillThresholdPx) {
                                     crossedOnce = true
                                 }
-                                if (!pillGestureTriggered && (cb.currentSettings.enablePillSwipeActions || idleWidgetSwipe())) {
+                                if (!pillGestureTriggered && !cutoutSwipeClaimed &&
+                                    (cb.currentSettings.enablePillSwipeActions || idleWidgetSwipe())
+                                ) {
                                     if (pillArming.update(dragAccumulatorX, dragAccumulatorY, android.os.SystemClock.uptimeMillis())) {
                                         holdJob.cancel()
                                         IslandHaptics.play(context, HapticStrength.fromId(cb.currentSettings.hapticStrength), HapticKind.Merge)
@@ -619,7 +683,11 @@ internal fun Modifier.islandMainGestures(
                                 cb.currentSettings.enableSwipeActions &&
                                     expandedSwipeFires(expandedArming.direction, stepsActive, cb)
                             } else {
-                                !pillGestureTriggered && (cb.currentSettings.enablePillSwipeActions || idleWidgetSwipe()) && pillArming.direction != null
+                                !pillGestureTriggered && (
+                                    isInward(rawDragX, rawDragY) ||
+                                        isOutward(rawDragX, rawDragY) ||
+                                        ((cb.currentSettings.enablePillSwipeActions || idleWidgetSwipe()) && pillArming.direction != null)
+                                )
                             }
                             showDeadZone(!pillGestureTriggered && deadZoneCue(tapGuard.exceeded, liftFires, stepFollowsFinger(stepMode)))
                         }

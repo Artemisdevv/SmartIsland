@@ -398,6 +398,10 @@ internal fun buildSettingsSearchIndex(str: (Int) -> String): List<SettingsSearch
         str(R.string.card_gestures_guide_desc), listOf("swipe", "tap", "long press", "hold", "touch", "guide", "tour", "tutorial", "how to", "new user", "gestures list")
     )
     add(
+        "gestures.apple_style", str(R.string.apple_style_gestures_title), gestures, gestureScreen, Icons.Rounded.Gesture,
+        str(R.string.apple_style_gestures_desc), listOf("camera", "cutout", "hide", "restore", "swipe")
+    )
+    add(
         "gestures.sensitivity", str(R.string.gesture_sensitivity_title), gestures, gestureScreen, Icons.Rounded.Gesture,
         str(R.string.gesture_sensitivity_desc),
         listOf("sensitivity", "sensitive", "threshold", "accidental", "wrong gesture", "swipe distance", "high", "low"),

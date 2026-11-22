@@ -7,22 +7,36 @@
 
 package com.agupta07505.smartisland.ui
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import com.agupta07505.smartisland.data.AppShortcutProvider
 import com.agupta07505.smartisland.data.LaunchableApp
+import com.agupta07505.smartisland.data.SmartIslandSettings
 import com.agupta07505.smartisland.model.IslandNotification
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 
+internal data class CutoutAnimation(
+    val screenCenter: Offset,
+    val pivot: Offset? = null,
+    val exitCard: IslandNotification? = null,
+    val exitSettings: SmartIslandSettings? = null
+)
+
 @Composable
-fun OverlayIsland(
+internal fun OverlayIsland(
     viewModel: IslandViewModel,
     statusBarHeight: Float,
     onOpenNotification: (IslandNotification) -> Unit,
@@ -31,16 +45,26 @@ fun OverlayIsland(
     onOpenFloatingWindow: () -> Unit,
     onOpenNotificationShade: () -> Unit = {},
     modifier: Modifier = Modifier,
-    isFullWidth: Boolean = true
+    isFullWidth: Boolean = true,
+    appleGestureCenterX: Float? = null,
+    canUseAppleGesture: () -> Boolean = { true },
+    onHideActivity: (IslandNotification) -> Boolean = viewModel::hideActivity,
+    cutoutAnimation: CutoutAnimation? = null,
+    onCutoutAnimationFinished: (CutoutAnimation) -> Unit = {}
 ) {
     val shadeOpen by viewModel.shadeOpen.collectAsState()
     val idleSuppressed by viewModel.idleWidgetsSuppressed.collectAsState()
-    val settings by viewModel.displaySettings.collectAsState()
+    val liveSettings by viewModel.displaySettings.collectAsState()
+    val settings = cutoutAnimation?.exitSettings ?: liveSettings
+    val portraitAppleGestures = settings.appleStyleGestures &&
+        androidx.compose.ui.platform.LocalConfiguration.current.orientation !=
+            android.content.res.Configuration.ORIENTATION_LANDSCAPE
     val expanded by viewModel.expanded.collectAsState()
     val widgetIslandOpen by viewModel.widgetIslandOpen.collectAsState()
     val widgetIslandSnap by viewModel.widgetIslandSnap.collectAsState()
     val appsLauncherOpen by viewModel.appsLauncherOpen.collectAsState()
-    val notifications by viewModel.visibleNotifications.collectAsState()
+    val liveNotifications by viewModel.visibleNotifications.collectAsState()
+    val notifications = cutoutAnimation?.exitCard?.let { listOf(it) } ?: liveNotifications
     val selectedIndex by viewModel.selectedIndex.collectAsState()
     val isLocked by viewModel.isLocked.collectAsState()
     val isInputActive by viewModel.isInputActive.collectAsState()
@@ -64,6 +88,22 @@ fun OverlayIsland(
     val faceIdState by com.agupta07505.smartisland.util.FaceIdController.state.collectAsState()
     val quiet = staticPill || faceIdState.active
     val context = LocalContext.current
+    val cutoutProgress = remember {
+        Animatable(if (cutoutAnimation != null && cutoutAnimation.exitCard == null) 0f else 1f)
+    }
+    LaunchedEffect(cutoutAnimation) {
+        if (cutoutAnimation == null) {
+            cutoutProgress.snapTo(1f)
+        } else if (cutoutAnimation.pivot != null) {
+            val end = if (cutoutAnimation.exitCard != null) 0f else 1f
+            if (com.agupta07505.smartisland.util.SystemAnimScale.animationsOff()) {
+                cutoutProgress.snapTo(end)
+            } else {
+                cutoutProgress.animateTo(end, tween(durationMillis = 225, easing = FastOutSlowInEasing))
+            }
+            onCutoutAnimationFinished(cutoutAnimation)
+        }
+    }
 
     // Rotation: everything fades out at once and returns on the pill's arrival spring and fade curve (RotationVeil).
     val veilSpeed = settings.animationSpeed(
@@ -259,7 +299,11 @@ fun OverlayIsland(
         // that tells the owner whether the tap counted.
         onOpenAppsLauncher = { viewModel.openAppsLauncher() },
         onIdleDotTap = {
-            if (viewModel.onIdleDotTapped() != com.agupta07505.smartisland.model.IdleDotTap.None) stepTapHaptic()
+            if (portraitAppleGestures) {
+                if (canUseAppleGesture()) viewModel.collapse()
+            } else if (viewModel.onIdleDotTapped() != com.agupta07505.smartisland.model.IdleDotTap.None) {
+                stepTapHaptic()
+            }
         },
         idleClosing = idleClosing,
         appsLauncherOpen = appsLauncherOpen && expanded,
@@ -268,8 +312,23 @@ fun OverlayIsland(
         onWidgetIslandChange = { viewModel.setWidgetIslandOpen(it) },
         onWidgetIslandShownChange = { viewModel.widgetIslandShown.value = it },
         widgetIslandSnap = widgetIslandSnap,
+        appleGestureCenterX = appleGestureCenterX,
+        canUseAppleGesture = canUseAppleGesture,
+        onHideActivity = onHideActivity,
+        onRestoreActivity = viewModel::restoreHiddenActivity,
+        canRestoreActivity = { viewModel.hasManuallyHiddenActivity.value },
         modifier = modifier.graphicsLayer {
             alpha = com.agupta07505.smartisland.model.RotationVeil.alpha(veilVisible.value)
+            if (cutoutAnimation != null) {
+                val progress = cutoutProgress.value
+                alpha *= progress
+                scaleX = 0.16f + 0.84f * progress
+                scaleY = scaleX
+                val pivot = cutoutAnimation.pivot
+                if (pivot != null && size.width > 0f && size.height > 0f) {
+                    transformOrigin = TransformOrigin(pivot.x / size.width, pivot.y / size.height)
+                }
+            }
         }
     )
     }

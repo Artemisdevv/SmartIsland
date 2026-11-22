@@ -427,6 +427,13 @@ class SmartIslandSettingsTest {
     }
 
     @Test
+    fun appleStyleGesturesDefaultsOffAndSurvivesBackup() {
+        assertFalse(SmartIslandSettings.fromJson("{}").appleStyleGestures)
+        val enabled = SmartIslandSettings.Default.copy(appleStyleGestures = true)
+        assertTrue(SmartIslandSettings.fromJson(enabled.toJson()).appleStyleGestures)
+    }
+
+    @Test
     fun gestureSensitivityDefaultsRoundTripsAndFallsBack() {
         assertEquals("normal", SmartIslandSettings.Default.gestureSensitivity)
         val restored = SmartIslandSettings.fromJson(SmartIslandSettings.Default.copy(gestureSensitivity = "low").toJson())

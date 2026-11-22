@@ -7,6 +7,7 @@
 
 package com.agupta07505.smartisland.ui
 
+import com.agupta07505.smartisland.data.SmartIslandSettings
 import com.agupta07505.smartisland.data.SmartIslandNotificationRepository
 import com.agupta07505.smartisland.data.SmartIslandSettingsRepository
 import com.agupta07505.smartisland.model.IslandMode
@@ -25,7 +26,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import io.mockk.mockk
+import io.mockk.every
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class IslandViewModelTest {
@@ -532,6 +535,106 @@ class IslandViewModelTest {
         key = "music", packageName = "com.music", appName = "Music", title = "Song", text = "Artist",
         mode = IslandMode.Music, mediaIsPlaying = playing, timeMillis = 1L
     )
+
+    @Test
+    fun appleStyleHideAndRestoreUsesTheLiveSessionAcrossUpdatesAndUnlock() = runTest {
+        val settingsRepo = mockk<SmartIslandSettingsRepository>()
+        every { settingsRepo.settings } returns MutableStateFlow(
+            SmartIslandSettings(appleStyleGestures = true, hideOnLockScreenPackages = setOf("com.music"))
+        )
+        val repo = SmartIslandNotificationRepository()
+        val viewModel = IslandViewModel(settingsRepo, repo)
+        val media = music(playing = true).copy(mediaToken = mockk())
+        val updated = media.copy(key = "new-notification-key", title = "Next track", mediaPositionMs = 3_000L)
+        try {
+            repo.postNotification(media, autoExpand = false)
+            testDispatcher.scheduler.runCurrent()
+
+            viewModel.isLocked.value = true
+            testDispatcher.scheduler.runCurrent()
+            assertTrue(viewModel.visibleNotifications.value.isEmpty())
+            viewModel.isLocked.value = false
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(listOf(media), viewModel.visibleNotifications.value)
+
+            assertTrue(viewModel.hideActivity(media))
+            testDispatcher.scheduler.runCurrent()
+            assertTrue(viewModel.visibleNotifications.value.isEmpty())
+            assertEquals(listOf(media), repo.notifications.value)
+            assertTrue(viewModel.hasManuallyHiddenActivity.value)
+
+            repo.removeNotification(media.key)
+            testDispatcher.scheduler.runCurrent()
+            assertFalse(viewModel.hasManuallyHiddenActivity.value)
+            repo.postNotification(updated, autoExpand = false)
+            repo.postNotification(
+                IslandNotification(key = "new-timer", packageName = "clock", appName = "Clock", title = "Timer",
+                    text = "0:30", timeMillis = 0L, mode = IslandMode.Timer),
+                autoExpand = false
+            )
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(listOf("new-timer"), viewModel.visibleNotifications.value.map { it.key })
+
+            viewModel.isLocked.value = true
+            testDispatcher.scheduler.runCurrent()
+            assertFalse(viewModel.restoreHiddenActivity())
+            viewModel.isLocked.value = false
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(listOf("new-timer"), viewModel.visibleNotifications.value.map { it.key })
+            assertTrue(viewModel.hasManuallyHiddenActivity.value)
+
+            assertTrue(viewModel.restoreHiddenActivity())
+            testDispatcher.scheduler.runCurrent()
+            assertTrue(viewModel.visibleNotifications.value.contains(updated))
+            assertEquals(updated, viewModel.currentShownNotification())
+            assertFalse(viewModel.hasManuallyHiddenActivity.value)
+        } finally {
+            viewModel.viewModelScope.cancel()
+        }
+    }
+
+    @Test
+    fun appleStyleKeepsPlayingMusicWhileOrdinaryCardsStillIdleOut() = runTest {
+        val settingsRepo = mockk<SmartIslandSettingsRepository>()
+        val settings = MutableStateFlow(SmartIslandSettings(appleStyleGestures = true))
+        every { settingsRepo.settings } returns settings
+        val repo = SmartIslandNotificationRepository()
+        val viewModel = IslandViewModel(settingsRepo, repo)
+        val media = music(playing = true)
+        val timer = IslandNotification(key = "timer", packageName = "clock", appName = "Clock", title = "Timer",
+            text = "0:30", timeMillis = 0L, mode = IslandMode.Timer)
+        val message = IslandNotification(key = "message", packageName = "chat", appName = "Chat", title = "Message",
+            text = "Hello", timeMillis = 0L)
+        try {
+            repo.postNotification(media, autoExpand = false)
+            repo.postNotification(timer, autoExpand = false)
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(setOf(media.key, timer.key), viewModel.visibleNotifications.value.map { it.key }.toSet())
+
+            val timeout = settings.value.idleTimeoutMs + IslandViewModel.IDLE_TIMER_EXTRA_MS + 1
+            testDispatcher.scheduler.advanceTimeBy(timeout)
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(listOf(media), viewModel.visibleNotifications.value)
+            assertTrue(repo.notifications.value.contains(timer))
+
+            repo.postNotification(message, autoExpand = false)
+            testDispatcher.scheduler.runCurrent()
+            assertTrue(viewModel.visibleNotifications.value.contains(message))
+            testDispatcher.scheduler.advanceTimeBy(timeout)
+            testDispatcher.scheduler.runCurrent()
+            assertEquals(listOf(media), viewModel.visibleNotifications.value)
+            assertTrue(repo.notifications.value.contains(message))
+
+            settings.value = settings.value.copy(appleStyleGestures = false)
+            testDispatcher.scheduler.runCurrent()
+            assertFalse(viewModel.hideActivity(media))
+            testDispatcher.scheduler.advanceTimeBy(timeout)
+            testDispatcher.scheduler.runCurrent()
+            assertTrue(viewModel.visibleNotifications.value.isEmpty())
+        } finally {
+            viewModel.viewModelScope.cancel()
+        }
+    }
 
     @Test
     fun pausedMediaRevertsToIdleAfterTenSecondsAndResumeBringsItBack() = runTest {

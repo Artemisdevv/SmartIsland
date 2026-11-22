@@ -108,7 +108,12 @@ fun IslandOverlayView(
     widgetIslandOpen: Boolean = false,
     onWidgetIslandChange: (Boolean) -> Unit = {},
     onWidgetIslandShownChange: (Boolean) -> Unit = {},
-    widgetIslandSnap: Int = 0
+    widgetIslandSnap: Int = 0,
+    appleGestureCenterX: Float? = null,
+    canUseAppleGesture: () -> Boolean = { true },
+    onHideActivity: (IslandNotification) -> Boolean = { false },
+    onRestoreActivity: () -> Boolean = { false },
+    canRestoreActivity: () -> Boolean = { false }
 ) {
     val safeIndex = selectedIndex.coerceIn(0, (notifications.size - 1).coerceAtLeast(0))
     // Gesture code (pointerInput(Unit) never restarts its coroutine) reads these instead of capturing the parameters.
@@ -160,6 +165,11 @@ fun IslandOverlayView(
     val runner = remember(context, cb) { IslandActionRunner(context, cb) }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val appleStyle = settings.appleStyleGestures && !isLandscape
+    val canUseAppleGestureState = rememberUpdatedState(canUseAppleGesture)
+    val hideActivity = rememberUpdatedState(onHideActivity)
+    val restoreActivity = rememberUpdatedState(onRestoreActivity)
+    val canRestore = rememberUpdatedState(canRestoreActivity)
     val screenWidth = configuration.screenWidthDp.dp
     val screenCenter = screenWidth / 2f
     // Landscape (and portrait for a tap on the idle circle): when the last card goes, the collapsed cutout itself
@@ -458,7 +468,12 @@ fun IslandOverlayView(
                     pickerLeftFraction = pickerLeftFraction,
                     pickerOnLeft = pickerOnLeftState,
                     centreOverlapsCutout = centreOverlapsCutout,
-                    pillHasContent = com.agupta07505.smartisland.model.pillOnIsland(notifications.isNotEmpty(), widgetPill && isLandscape)
+                    pillHasContent = com.agupta07505.smartisland.model.pillOnIsland(notifications.isNotEmpty(), widgetPill && isLandscape),
+                    appleGestureCenterX = appleGestureCenterX,
+                    canUseAppleGesture = { canUseAppleGestureState.value() },
+                    onHideActivity = hideActivity,
+                    onRestoreActivity = restoreActivity,
+                    canRestoreActivity = canRestore
                 ),
             contentAlignment = Alignment.TopCenter
         ) {
@@ -555,7 +570,8 @@ fun IslandOverlayView(
         // is the pill's row, so the target sits at the cutout's spot inside it (the service adds the same rectangle to the touchable region).
         val cutoutTarget = cutoutArea?.let { com.agupta07505.smartisland.model.cutoutTouchTarget(it) }
         CutoutLongPressTarget(
-            enabled = !expanded && !isLandscape && !settings.enableNotchMode && cutoutTarget != null && !centreOverlapsCutout,
+            enabled = (!appleStyle || notifications.isEmpty()) && !expanded && !isLandscape &&
+                !settings.enableNotchMode && cutoutTarget != null && !centreOverlapsCutout,
             width = (cutoutTarget?.widthDp ?: 0f).dp,
             height = (cutoutTarget?.heightDp ?: 0f).dp,
             modifier = Modifier
@@ -595,6 +611,7 @@ fun IslandOverlayView(
             },
             onLongPress = {
                 ui.touch()
+                if (appleStyle) return@PortraitPillCenterTarget
                 IslandHaptics.play(context, HapticStrength.fromId(cb.currentSettings.hapticStrength), HapticKind.Hold)
                 val longPress = SwipeAction.fromId(cb.currentSettings.longPressAction, SwipeAction.TogglePill)
                 if (longPress != SwipeAction.None) {

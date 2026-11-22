@@ -27,6 +27,16 @@ import android.view.WindowManager
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.material3.ProvideTextStyle
+import androidx.compose.ui.geometry.Offset
+import androidx.core.view.doOnPreDraw
+import com.agupta07505.smartisland.model.CutoutArea
+import com.agupta07505.smartisland.model.CutoutRestore
+import com.agupta07505.smartisland.model.cutoutRestore
+import com.agupta07505.smartisland.model.cutoutWindowBounds
+import com.agupta07505.smartisland.ui.CutoutRestoreTarget
+import com.agupta07505.smartisland.ui.CutoutAnimation
+import com.agupta07505.smartisland.util.CameraCutoutDetector
+import com.agupta07505.smartisland.util.GestureSensitivity
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -82,6 +92,60 @@ class SmartIslandOverlayService : AccessibilityService() {
     private var torchCallbackRegistered = false
     private var foregroundStarted = false
     private val isTouchableRegionSupported = MutableStateFlow(false)
+    private data class RestoreTarget(val kind: CutoutRestore, val centerX: Float)
+    private val restoreTarget = MutableStateFlow<RestoreTarget?>(null)
+    private val cutoutAnimation = MutableStateFlow<CutoutAnimation?>(null)
+
+    private fun cutoutCenter(settings: SmartIslandSettings): Offset {
+        val area = restoreArea(settings, isLandscape = false)
+        val metrics = resources.displayMetrics
+        return Offset(
+            metrics.widthPixels / 2f + area.centreXDp * metrics.density,
+            (area.topDp + area.heightDp / 2f) * metrics.density
+        )
+    }
+
+    private fun ComposeView.localCutoutPivot(center: Offset): Offset {
+        val origin = IntArray(2)
+        getLocationOnScreen(origin)
+        return center - Offset(origin[0].toFloat(), origin[1].toFloat())
+    }
+
+    private fun hideActivityWithAnimation(card: IslandNotification): Boolean {
+        val view = islandView
+        val settings = viewModel.displaySettings.value
+        val previous = cutoutAnimation.value
+        if (view != null && viewModel.visibleNotifications.value.singleOrNull()?.key == card.key) {
+            val center = cutoutCenter(settings)
+            cutoutAnimation.value = CutoutAnimation(center, view.localCutoutPivot(center), card, settings)
+        }
+        val hidden = viewModel.hideActivity(card)
+        if (!hidden) cutoutAnimation.value = previous
+        return hidden
+    }
+
+    private fun finishCutoutAnimation(animation: CutoutAnimation) {
+        if (cutoutAnimation.value !== animation) return
+        cutoutAnimation.value = null
+        if (animation.exitCard != null) updateWindowLayoutParams(isWindowExpanded, viewModel.displaySettings.value)
+    }
+
+    private fun canUseAppleGestures(): Boolean =
+        !viewModel.isLocked.value && !viewModel.rotationVeil.value && !viewModel.shadeOpen.value &&
+            viewModel.exemptionNow() == com.agupta07505.smartisland.model.ExemptMode.None &&
+            !com.agupta07505.smartisland.util.FaceIdController.state.value.active &&
+            getSystemService(android.os.PowerManager::class.java)?.isInteractive == true
+
+    private fun cancelOverlayTouch() {
+        val view = islandView ?: return
+        val now = android.os.SystemClock.uptimeMillis()
+        val cancel = android.view.MotionEvent.obtain(now, now, android.view.MotionEvent.ACTION_CANCEL, 0f, 0f, 0)
+        try {
+            view.dispatchTouchEvent(cancel)
+        } finally {
+            cancel.recycle()
+        }
+    }
     @Volatile private var destroyed = false
     private var isWindowExpanded: Boolean = false
     private var widgetWindowOpen: Boolean = false
@@ -262,6 +326,7 @@ class SmartIslandOverlayService : AccessibilityService() {
                 val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
                 when (intent.action) {
                     Intent.ACTION_SCREEN_ON -> {
+                        cancelOverlayTouch()
                         overlayOwners.resume()
                         isLockScreenActive = keyguardManager?.isKeyguardLocked == true
                         com.agupta07505.smartisland.util.AppLogRecorder.i(
@@ -277,6 +342,7 @@ class SmartIslandOverlayService : AccessibilityService() {
                         )
                     }
                     Intent.ACTION_SCREEN_OFF -> {
+                        cancelOverlayTouch()
                         overlayOwners.pause()
                         viewModel.closeWidgetIsland(snap = true)
                         // The shade closes with the screen; its window event may come late.
@@ -292,12 +358,14 @@ class SmartIslandOverlayService : AccessibilityService() {
                         )
                     }
                     Intent.ACTION_USER_PRESENT -> {
+                        cancelOverlayTouch()
                         isLockScreenActive = false
                         faceUnlockCoordinator.onUserPresent(android.os.SystemClock.elapsedRealtime())
                         updateWindowLayoutParams(
                             isWindowExpanded,
                             viewModel.displaySettings.value
                         )
+                        refreshWindowsThrottled(viewModel.isLocked.value)
                     }
                 }
             }
@@ -589,6 +657,8 @@ class SmartIslandOverlayService : AccessibilityService() {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        cancelOverlayTouch()
+        cachedCutout = null
         // The expanded island's "system" look follows the phone's dark mode.
         com.agupta07505.smartisland.ui.expanded.SystemNight.update(newConfig.uiMode)
         // Wrapped: a throw here would make Android disable the service automatically.
@@ -618,6 +688,8 @@ class SmartIslandOverlayService : AccessibilityService() {
 
     private fun beginRotationVeil() {
         if (destroyed || !::viewModel.isInitialized) return
+        cancelOverlayTouch()
+        cachedCutout = null
         // A turn closes the widget island at once (the pill it grew out of changes size and place).
         viewModel.closeWidgetIsland(snap = true)
         // "Remove animations": no fade, so nothing is hidden either.
@@ -1013,6 +1085,21 @@ class SmartIslandOverlayService : AccessibilityService() {
         }
 
         serviceScope.launch {
+            runSuspendCatchingLogged(TAG, "Restore target collector failed") {
+                kotlinx.coroutines.flow.combine(
+                    viewModel.hasIdleStoredCards, viewModel.hasManuallyHiddenActivity,
+                    viewModel.shadeOpen, viewModel.rotationVeil
+                ) { idle, manual, shade, rotating ->
+                    (idle || manual) && !shade && !rotating
+                }.collectLatest {
+                    if (!destroyed && viewModel.displaySettings.value.enabled) {
+                        updateWindowLayoutParams(isWindowExpanded, viewModel.displaySettings.value)
+                    }
+                }
+            }
+        }
+
+        serviceScope.launch {
             runSuspendCatchingLogged(TAG, "Effective-settings collector failed") {
                 // Fires when the user edits a profile or the phone rotates and the other profile applies.
                 viewModel.displaySettings.collectLatest { effective ->
@@ -1226,8 +1313,40 @@ class SmartIslandOverlayService : AccessibilityService() {
                 isFocusableInTouchMode = true
                 setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
                 setContent {
-                    val fullWidth by isTouchableRegionSupported.collectAsState()
+                    val restore by restoreTarget.collectAsState()
+                    val animation by cutoutAnimation.collectAsState()
                     val fontSettings by viewModel.settings.collectAsState()
+                    val target = restore
+                    if (target != null) {
+                        CutoutRestoreTarget(
+                            target.kind, target.centerX, GestureSensitivity.fromId(fontSettings.gestureSensitivity)
+                        ) {
+                            if (target.kind == CutoutRestore.Manual) {
+                                if (canUseAppleGestures()) {
+                                    cutoutAnimation.value = CutoutAnimation(cutoutCenter(viewModel.displaySettings.value))
+                                    if (!viewModel.restoreHiddenActivity()) cutoutAnimation.value = null
+                                }
+                            } else if (!viewModel.shadeOpen.value) {
+                                viewModel.revealIdleCards()
+                            }
+                        }
+                        return@setContent
+                    }
+
+                    val fullWidth by isTouchableRegionSupported.collectAsState()
+                    val displaySettings by viewModel.displaySettings.collectAsState()
+                    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+                    val density = androidx.compose.ui.platform.LocalDensity.current.density
+                    val appleGestureCenterX = remember(
+                        displaySettings.appleStyleGestures, displaySettings.cameraCutoutManual,
+                        displaySettings.cameraCutoutX, displaySettings.xOffset, configuration, density
+                    ) {
+                        if (displaySettings.appleStyleGestures &&
+                            configuration.orientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                        ) {
+                            resources.displayMetrics.widthPixels / 2f + restoreArea(displaySettings, false).centreXDp * density
+                        } else null
+                    }
                     val islandFont = remember(
                         fontSettings.islandFont, fontSettings.fontMixEnabled,
                         fontSettings.fontMixLight, fontSettings.fontMixRegular, fontSettings.fontMixMedium
@@ -1240,21 +1359,28 @@ class SmartIslandOverlayService : AccessibilityService() {
                             serviceScope.launch { repository.setShortcutPackages(order) }
                         }
                     ) {
-                    ProvideTextStyle(TextStyle(fontFamily = islandFont)) {
-                        OverlayIsland(
-                            viewModel = this@SmartIslandOverlayService.viewModel,
-                            statusBarHeight = statusBarHeight,
-                            onOpenNotification = { notification -> openNotification(notification) },
-                            onLaunchApp = { packageName -> launchApp(packageName) },
-                            onAppAction = { packageName, action -> launchAppAction(packageName, action) },
-                            onOpenFloatingWindow = { openCurrentNotificationInFloatingWindow() },
-                            onOpenNotificationShade = {
-                                performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
-                                viewModel.collapse()
-                            },
-                            isFullWidth = fullWidth
-                        )
-                    }
+                        ProvideTextStyle(TextStyle(fontFamily = islandFont)) {
+                            OverlayIsland(
+                                viewModel = this@SmartIslandOverlayService.viewModel,
+                                statusBarHeight = statusBarHeight,
+                                onOpenNotification = { notification -> openNotification(notification) },
+                                onLaunchApp = { packageName -> launchApp(packageName) },
+                                onAppAction = { packageName, action -> launchAppAction(packageName, action) },
+                                onOpenFloatingWindow = { openCurrentNotificationInFloatingWindow() },
+                                onOpenNotificationShade = {
+                                    performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                                    viewModel.collapse()
+                                },
+                                isFullWidth = fullWidth,
+                                appleGestureCenterX = appleGestureCenterX,
+                                canUseAppleGesture = {
+                                    cutoutAnimation.value?.exitCard == null && canUseAppleGestures()
+                                },
+                                onHideActivity = ::hideActivityWithAnimation,
+                                cutoutAnimation = animation,
+                                onCutoutAnimationFinished = ::finishCutoutAnimation
+                            )
+                        }
                     }
                 }
 
@@ -1324,7 +1450,9 @@ class SmartIslandOverlayService : AccessibilityService() {
                     val settingsVal = viewModel.displaySettings.value
                     val notificationsCount = viewModel.visibleNotifications.value.size
                     val isIdleHidden = settingsVal.hideWhenIdle && notificationsCount == 0 && !settingsVal.enableAppShortcuts
-                    if (isGone || isIdleHidden) {
+                    if (!isGone && restoreTarget.value != null) {
+                        setTouchableInsetsMethod.invoke(insets, TOUCHABLE_INSETS_FRAME)
+                    } else if (isGone || isIdleHidden) {
                         setTouchableInsetsMethod.invoke(insets, TOUCHABLE_INSETS_REGION)
                         val region = touchableRegionField.get(insets) as android.graphics.Region
                         region.setEmpty()
@@ -1437,6 +1565,15 @@ class SmartIslandOverlayService : AccessibilityService() {
         }
     }
 
+    private fun restoreArea(settings: SmartIslandSettings, isLandscape: Boolean): CutoutArea {
+        if (!isLandscape) {
+            val detected = detectedCutout()
+            if (!settings.cameraCutoutManual && detected.rawArea != null) return detected.rawArea
+            CameraCutoutDetector.areaFor(settings, detected, false)?.let { return it }
+        }
+        return CutoutArea(settings.xOffset, settings.yOffset, 0f, settings.height)
+    }
+
     private fun cutoutTouchRect(settingsVal: SmartIslandSettings, isLandscapeNow: Boolean, windowHeightPx: Int): android.graphics.Rect? {
         if (!isTouchableRegionSupported.value) return null
         val area = com.agupta07505.smartisland.util.CameraCutoutDetector.areaFor(settingsVal, detectedCutout(), isLandscapeNow) ?: return null
@@ -1547,6 +1684,7 @@ class SmartIslandOverlayService : AccessibilityService() {
         
         val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
         val isLocked = keyguardManager?.isKeyguardLocked == true
+        if (viewModel.isLocked.value != isLocked) cancelOverlayTouch()
         isLockScreenActive = isLocked
         viewModel.isLocked.value = isLocked
         
@@ -1560,6 +1698,15 @@ class SmartIslandOverlayService : AccessibilityService() {
         val targetVisibility = if (isHidden) android.view.View.GONE else android.view.View.VISIBLE
         if (view.visibility != targetVisibility) {
             view.visibility = targetVisibility
+        }
+        cutoutAnimation.value?.let { animation ->
+            val exitCard = animation.exitCard
+            val canAnimate = !isHidden && !isLandscape && !expanded && !widgetWindowOpen &&
+                settings.appleStyleGestures && canUseAppleGestures()
+            if (canAnimate && exitCard != null &&
+                viewModel.visibleNotifications.value.all { it.key == exitCard.key }
+            ) return // Keep the outgoing window at its current size until the exit completes.
+            if (!canAnimate || exitCard != null) cutoutAnimation.value = null
         }
 
         val isSplitMode = !isStatic && com.agupta07505.smartisland.model.hasSecondaryCutout(
@@ -1608,7 +1755,20 @@ class SmartIslandOverlayService : AccessibilityService() {
         val faceIdState = com.agupta07505.smartisland.util.FaceIdController.state.value
         val fullWindow = expanded || widgetWindowOpen ||
             (faceIdState.active && faceIdState.style != com.agupta07505.smartisland.util.FaceIdController.Style.Cutout)
-        val h = if (fullWindow || preGrown) {
+        val restoreKind = if (!isHidden && !isStatic && !expanded && !widgetWindowOpen &&
+            !faceIdState.active && !viewModel.shadeOpen.value && !viewModel.rotationVeil.value
+        ) {
+            cutoutRestore(visibleCount > 0, viewModel.hasManuallyHiddenActivity.value,
+                viewModel.hasIdleStoredCards.value, settings.hideWhenIdle)
+        } else null
+        val restoreArea = restoreKind?.let { restoreArea(settings, isLandscape) }
+        val restoreBounds = restoreArea?.let { cutoutWindowBounds(it, density, screenWidthPx.toInt()) }
+        val target = if (restoreKind != null && restoreArea != null && restoreBounds != null) {
+            RestoreTarget(restoreKind, screenWidthPx / 2f + restoreArea.centreXDp * density - restoreBounds.left)
+        } else null
+        val h = if (restoreBounds != null) {
+            restoreBounds.height
+        } else if (fullWindow || preGrown) {
             WindowManager.LayoutParams.MATCH_PARENT
         } else {
             maxOf(
@@ -1616,7 +1776,9 @@ class SmartIslandOverlayService : AccessibilityService() {
                 dotRect?.bottom ?: 0
             )
         }
-        val w = if (fullWindow || isTouchableRegionSupported.value) {
+        val w = if (restoreBounds != null) {
+            restoreBounds.width
+        } else if (fullWindow || isTouchableRegionSupported.value) {
             WindowManager.LayoutParams.MATCH_PARENT
         } else {
             (groupWidthPx + 32f * density).toInt()
@@ -1629,15 +1791,19 @@ class SmartIslandOverlayService : AccessibilityService() {
         } else 0
         // A static pill is never touched: the window ignores touches altogether (this also covers devices where the touchable
         // region cannot be set and the window is as wide as the pill).
-        val noTouch = if (isStatic) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0
+        val idleWithoutTarget = settings.hideWhenIdle && visibleCount == 0 && !settings.enableAppShortcuts
+        val noTouch = if (isStatic || (restoreKind == CutoutRestore.Manual && !canUseAppleGestures()) ||
+            (restoreKind == null && idleWithoutTarget && !fullWindow)
+        ) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0
         val currentFlags = focusFlags or watchOutside or noTouch or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
 
-        val currentX = if (fullWindow || isTouchableRegionSupported.value) 0 else windowXPx
-        val currentY = if (settings.enableNotchMode || isLandscape) 0 else settings.yOffset.dpToPx()
+        val currentGravity = Gravity.TOP or if (restoreBounds != null) Gravity.LEFT else Gravity.CENTER_HORIZONTAL
+        val currentX = restoreBounds?.left ?: if (fullWindow || isTouchableRegionSupported.value) 0 else windowXPx
+        val currentY = restoreBounds?.top ?: if (settings.enableNotchMode || isLandscape) 0 else settings.yOffset.dpToPx()
         val currentSoftInputMode = if (isInput) {
             WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE
@@ -1650,10 +1816,12 @@ class SmartIslandOverlayService : AccessibilityService() {
             lp.width == w &&
             lp.height == h &&
             lp.flags == currentFlags &&
+            lp.gravity == currentGravity &&
             lp.x == currentX &&
             lp.y == currentY &&
             lp.softInputMode == currentSoftInputMode
         ) {
+            updateRestoreTarget(view, target)
             return
         }
 
@@ -1664,7 +1832,7 @@ class SmartIslandOverlayService : AccessibilityService() {
             currentFlags,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            gravity = currentGravity
             x = currentX
             y = currentY
             softInputMode = currentSoftInputMode
@@ -1672,14 +1840,32 @@ class SmartIslandOverlayService : AccessibilityService() {
                 layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
+        runCatchingLogged(TAG, "Failed to update view layout") {
+            windowManager.updateViewLayout(view, params)
+        } ?: return
         lastParams = params
-        runCatchingLogged(TAG, "Failed to update view layout") { 
-            windowManager.updateViewLayout(view, params) 
+        updateRestoreTarget(view, target)
+    }
+
+    private fun updateRestoreTarget(view: ComposeView, target: RestoreTarget?) {
+        if (restoreTarget.value == target) return
+        restoreTarget.value = target
+        view.requestLayout()
+        val animation = cutoutAnimation.value
+        if (target == null && animation != null && animation.exitCard == null) {
+            view.doOnPreDraw {
+                if (islandView === view && cutoutAnimation.value === animation) {
+                    cutoutAnimation.value = animation.copy(pivot = view.localCutoutPivot(animation.screenCenter))
+                }
+            }
         }
     }
 
     private fun removeCollapsedWindow() {
         val view = islandView ?: return
+        cancelOverlayTouch()
+        restoreTarget.value = null
+        cutoutAnimation.value = null
         // Clear the reference before removal so repeated teardown calls are harmless,
         // even when an OEM WindowManager throws while detaching an already-removed view.
         islandView = null

@@ -107,6 +107,7 @@ class IslandViewModel(
     private var selectionKeys: List<String> = emptyList()
 
     private var pendingSelectKey: String? = null
+    private var pendingRestoreKey: String? = null
 
     private val baseVisible: StateFlow<List<IslandNotification>> = combine(
         notifications,
@@ -321,6 +322,56 @@ class IslandViewModel(
 
     fun togglePillHidden() = setPillHidden(!_pillHidden.value)
 
+    private val manuallyHidden = MutableStateFlow<List<HiddenActivity>>(emptyList())
+
+    internal val hasManuallyHiddenActivity = combine(manuallyHidden, baseVisible, _pillHidden) { hidden, cards, pillHidden ->
+        cards.any { card -> (!pillHidden || card.mode == IslandMode.IncomingCall) && hidden.any { it.matches(card) } }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    internal fun hideActivity(card: IslandNotification): Boolean {
+        if (!settings.value.appleStyleGestures || isLocked.value || shadeOpen.value || expanded.value) return false
+        val current = shownCard()?.takeIf { HiddenActivity(card).matches(it) } ?: return false
+        val activity = HiddenActivity(current)
+        manuallyHidden.update { hidden ->
+            (hidden.filterNot { it.matches(current) } + activity).takeLast(MAX_MANUALLY_HIDDEN)
+        }
+        return true
+    }
+
+    internal fun restoreHiddenActivity(): Boolean {
+        if (!settings.value.appleStyleGestures || isLocked.value || shadeOpen.value) return false
+        val eligible = applyPillHidden(baseVisible.value, _pillHidden.value)
+        val hidden = manuallyHidden.value
+        val card = hidden.asReversed().firstNotNullOfOrNull { activity -> eligible.firstOrNull(activity::matches) }
+            ?: return false
+        pendingRestoreKey = card.key
+        if (liveMayTimeOut(card)) userRevealedLive.update { it + card.key }
+        idleHidden.update { tokens -> tokens.filterNot { it.key == card.key }.toSet() }
+        manuallyHidden.value = hidden.filterNot { it.matches(card) }
+        return true
+    }
+
+    private data class HiddenActivity(
+        val key: String,
+        val packageName: String,
+        val mode: IslandMode,
+        val session: android.media.session.MediaSession.Token?
+    ) {
+        constructor(card: IslandNotification) : this(card.key, card.packageName, card.mode, card.mediaToken)
+
+        fun matches(card: IslandNotification): Boolean {
+            if (card.packageName != packageName || card.mode != mode) return false
+            return if (mode == IslandMode.Music && session != null && card.mediaToken != null) {
+                session == card.mediaToken
+            } else {
+                key == card.key
+            }
+        }
+    }
+
+    private fun withoutManuallyHidden(list: List<IslandNotification>): List<IslandNotification> =
+        list.filterNot { card -> manuallyHidden.value.any { it.matches(card) } }
+
     private val _emptyPillShown = MutableStateFlow(false)
     private var emptyPillJob: Job? = null
 
@@ -421,8 +472,9 @@ class IslandViewModel(
         baseVisible,
         idleHidden,
         _pillHidden,
-        shadeOpen
-    ) { list, hidden, pillHidden, shade ->
+        shadeOpen,
+        manuallyHidden
+    ) { list, hidden, pillHidden, shade, manual ->
         // The notification shade is open: no event is shown, only the idle cutout stays (cards wait in the repository).
         if (shade) {
             traceHidden(list, emptyList()) { "notification-shade-open" }
@@ -431,8 +483,10 @@ class IslandViewModel(
         val shown = if (hidden.isEmpty()) list
         else list.filterNot { it.awayToken() in hidden }
         traceHidden(list, shown) { "idle-timeout-put-away" }
-        applyPillHidden(shown, pillHidden).also { visible ->
-            traceHidden(shown, visible) { "pill-hidden(landscape or long press: only calls stay)" }
+        val afterManualHide = shown.filterNot { card -> manual.any { it.matches(card) } }
+        traceHidden(shown, afterManualHide) { "manually-hidden" }
+        applyPillHidden(afterManualHide, pillHidden).also { visible ->
+            traceHidden(afterManualHide, visible) { "pill-hidden(landscape or long press: only calls stay)" }
         }
     }.stateIn(
         scope = viewModelScope,
@@ -742,6 +796,8 @@ class IslandViewModel(
                     val orderChanged = keys != previousKeys
                     val pendingIndex = pendingSelectKey?.let { keys.indexOf(it) }?.takeIf { it >= 0 }
                     if (pendingIndex != null) pendingSelectKey = null
+                    val restoredIndex = pendingRestoreKey?.let { keys.indexOf(it) }?.takeIf { it >= 0 }
+                    if (restoredIndex != null) pendingRestoreKey = null
                     // Open island and the card it shows has gone (a system event ended, the app cancelled it): the island
                     // must not slide onto another card as if that one had just arrived. See ExpandedSelection.
                     val shownKeyBefore = previousList.getOrNull(selectedIndex.value)?.key
@@ -768,6 +824,7 @@ class IslandViewModel(
                     }
                     selectedIndex.update { currentSelected ->
                         when {
+                            restoredIndex != null -> restoredIndex
                             // Collapsed: the primary cutout always shows the top-priority card.
                             (orderChanged || recorderEnded) && !expanded.value -> 0
                             // Auto-expand picked a card of this very list: keep it.
@@ -843,6 +900,11 @@ class IslandViewModel(
                     }
                     // A live card that is gone is forgotten, so the same app's next one is "automatic" again.
                     val rawKeys = raw.mapTo(HashSet()) { it.key }
+                    manuallyHidden.update { hidden ->
+                        // A live session can repost its notification under a different key with a gap between the
+                        // two posts. Only a card currently in the repository can turn that token into a restore target.
+                        hidden.filter { activity -> activity.session != null || raw.any(activity::matches) }
+                    }
                     replyDrafts.retainOnly(rawKeys)
                     userRevealedLive.update { revealed ->
                         if (revealed.all { it in rawKeys }) revealed else revealed.filterTo(HashSet()) { it in rawKeys }
@@ -854,19 +916,33 @@ class IslandViewModel(
             runSuspendCatchingLogged(TAG, "Static idle timeout failed") {
                 // Island collapsed, not being typed in, and every card is idle-able (static notification, paused
                 // media, paused live card): after the timeout the island returns to the idle cutout.
-                combine(visibleNotifications, expanded, isInputActive) { list, isExpanded, inputActive ->
-                    if (isExpanded || inputActive || list.isEmpty()) null
-                    else if (list.any { !IslandPriority.canIdleOut(it) }) null
-                    else list.map { it.key }
+                combine(visibleNotifications, expanded, isInputActive, settings) { list, isExpanded, inputActive, config ->
+                    // Playing music can stay up indefinitely in Apple-style mode. It should not keep unrelated
+                    // ordinary cards on screen indefinitely too.
+                    val eligible = if (config.appleStyleGestures) list.filterNot { it.isPlayingMusic() } else list
+                    if (isExpanded || inputActive || eligible.isEmpty()) null
+                    else if (eligible.any { !IslandPriority.canIdleOut(it) }) null
+                    else eligible.map { it.key }
                 }.distinctUntilChanged().collectLatest { keys ->
                     if (keys == null) return@collectLatest
                     // Timeout set to "never": cards stay on the island until the app or the user removes them.
                     if (settings.value.idleTimeoutMs >= SmartIslandSettings.IDLE_TIMEOUT_NEVER_MS) return@collectLatest
                     delay(settings.value.idleTimeoutMs.toLong() + IDLE_TIMER_EXTRA_MS)
                     val tokens = visibleNotifications.value
-                        .filter { IslandPriority.canIdleOut(it) }
+                        .filter { it.key in keys && IslandPriority.canIdleOut(it) }
                         .map { it.idleToken() }
                     idleHidden.update { it + tokens }
+                }
+            }
+        }
+        viewModelScope.launch {
+            settings.map { it.appleStyleGestures }.distinctUntilChanged().collect { enabled ->
+                if (!enabled) {
+                    manuallyHidden.value = emptyList()
+                } else {
+                    val playing = notifications.value.filter { it.isPlayingMusic() }
+                        .mapTo(HashSet()) { it.key }
+                    idleHidden.update { tokens -> tokens.filterNot { it.key in playing }.toSet() }
                 }
             }
         }
@@ -874,9 +950,9 @@ class IslandViewModel(
             runSuspendCatchingLogged(TAG, "Live idle timeout failed") {
                 // Live idle timeout: a live card (music, navigation, timer, recorder, ...) that came onto the island
                 // by itself goes back to the idle cutout after the collapsed-pill timer, like a static one.
-                combine(visibleNotifications, expanded, isInputActive, userRevealedLive, orientation) { list, isExpanded, inputActive, revealed, _ ->
+                combine(visibleNotifications, expanded, isInputActive, userRevealedLive, settings) { list, isExpanded, inputActive, revealed, config ->
                     if (isExpanded || inputActive) null
-                    else list.filter { liveMayTimeOut(it) && it.key !in revealed }
+                    else list.filter { liveMayTimeOut(it, config.appleStyleGestures) && it.key !in revealed }
                         .mapTo(HashSet()) { it.key }
                         .takeIf { it.isNotEmpty() }
                 }.distinctUntilChanged().collectLatest { keys ->
@@ -885,7 +961,7 @@ class IslandViewModel(
                     if (settings.value.idleTimeoutMs >= SmartIslandSettings.IDLE_TIMEOUT_NEVER_MS) return@collectLatest
                     delay(settings.value.idleTimeoutMs.toLong() + IDLE_TIMER_EXTRA_MS)
                     val tokens = visibleNotifications.value
-                        .filter { it.key in keys && liveMayTimeOut(it) }
+                        .filter { it.key in keys && liveMayTimeOut(it, settings.value.appleStyleGestures) }
                         .map { it.awayToken() }
                     if (tokens.isNotEmpty()) idleHidden.update { it + tokens }
                 }
@@ -918,10 +994,10 @@ class IslandViewModel(
                     // switches or the foreground app, which would pick the wrong index or open an empty island.
                     endPopup()
                     val visible = IslandPriority.order(
-                        applyPillHidden(
+                        withoutManuallyHidden(applyPillHidden(
                             filterVisible(notifications.value, foregroundPackage.value, settings.value, isLocked.value),
                             _pillHidden.value
-                        )
+                        ))
                     )
                     val index = visible.indexOfFirst { it.key == key }
                     // Typing a reply: a ringing call (the only event that gets this far on an open island) takes the card;
@@ -1352,10 +1428,10 @@ class IslandViewModel(
                 }
 
                 val full = IslandPriority.order(
-                    applyPillHidden(
+                    withoutManuallyHidden(applyPillHidden(
                         filterVisible(notifications.value, foregroundPackage.value, settings.value, isLocked.value),
                         _pillHidden.value
-                    )
+                    ))
                 )
                 val currentKey = visibleNotifications.value.getOrNull(selectedIndex.value)?.key
                 val target = nextEventTarget(full, currentKey, forward) ?: return@runSuspendCatchingLogged
@@ -1459,8 +1535,11 @@ class IslandViewModel(
     private fun IslandNotification.awayToken() =
         if (IslandPriority.canIdleOut(this)) idleToken() else IdleToken(key, 0L, liveAwayHash(this))
 
-    private fun liveMayTimeOut(n: IslandNotification) =
+    private fun IslandNotification.isPlayingMusic() = mode == IslandMode.Music && mediaIsPlaying
+
+    private fun liveMayTimeOut(n: IslandNotification, appleStyleGestures: Boolean = false) =
         !IslandPriority.canIdleOut(n) && n.mode != IslandMode.IncomingCall &&
+            !(appleStyleGestures && n.isPlayingMusic()) &&
             // Navigation stays until the trip ends or the user puts it away; it never times out by itself.
             n.mode != IslandMode.Navigation &&
             // Portrait: a live activity stays until it ends or the user puts it away (tap on the idle cutout).
@@ -1472,6 +1551,7 @@ class IslandViewModel(
 
     companion object {
         private const val TAG = "IslandViewModel"
+        private const val MAX_MANUALLY_HIDDEN = 32
 
         /** Added to the collapsed pill's auto-close timer (the idle timeout setting) before it closes by itself. */
         const val IDLE_TIMER_EXTRA_MS = 1_000L
